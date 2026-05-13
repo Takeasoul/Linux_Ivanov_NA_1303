@@ -1,0 +1,12 @@
+*.o
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+.*.cmd
+*.img
+Module.markers
+modules.order
+Module.symvers
+tools/simplefsctl
