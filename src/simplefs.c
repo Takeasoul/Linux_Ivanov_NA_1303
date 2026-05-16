@@ -1,6 +1,8 @@
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
+#include <linux/capability.h>
+#include <linux/compat.h>
 #include <linux/crc32.h>
 #include <linux/fs.h>
 #include <linux/fs_context.h>
@@ -744,18 +746,30 @@ static long simplefs_dir_ioctl(struct file *file, unsigned int cmd, unsigned lon
 
 	switch (cmd) {
 	case SIMPLEFS_IOCTL_ZERO_FILES:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		ret = mnt_want_write_file(file);
+		if (ret)
+			return ret;
 		ret = simplefs_writeback_cached_files(sb);
 		if (!ret)
 			ret = simplefs_zero_all_files(sb);
 		if (!ret)
 			simplefs_invalidate_cached_files(sb);
+		mnt_drop_write_file(file);
 		break;
 	case SIMPLEFS_IOCTL_WIPE_FS:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		ret = mnt_want_write_file(file);
+		if (ret)
+			return ret;
 		ret = simplefs_writeback_cached_files(sb);
 		if (!ret)
 			ret = simplefs_wipe_fs(sb);
 		if (!ret)
 			simplefs_invalidate_cached_files(sb);
+		mnt_drop_write_file(file);
 		break;
 	case SIMPLEFS_IOCTL_GET_HASHES:
 	{
@@ -807,7 +821,7 @@ static const struct file_operations simplefs_dir_operations = {
 	.llseek = generic_file_llseek,
 	.unlocked_ioctl = simplefs_dir_ioctl,
 #ifdef CONFIG_COMPAT
-	.compat_ioctl = simplefs_dir_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 #endif
 };
 
