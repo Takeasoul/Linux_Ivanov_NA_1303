@@ -15,11 +15,11 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mpage.h>
-#include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/pagemap.h>
 #include <linux/parser.h>
 #include <linux/random.h>
+#include <linux/rwsem.h>
 #include <linux/slab.h>
 #include <linux/statfs.h>
 #include <linux/uaccess.h>
@@ -64,7 +64,7 @@ struct simplefs_info {
 	u32 name_width;
 	u32 block_size;
 	bool erased;
-	struct mutex ioctl_lock;
+	struct rw_semaphore state_lock;
 };
 
 static char *device_name;
@@ -469,6 +469,32 @@ static void simplefs_forget_file_dentries(struct super_block *sb)
 	}
 }
 
+static void simplefs_detach_cached_files(struct super_block *sb)
+{
+	struct simplefs_info *sbi = simplefs_sb_info(sb);
+	u32 file_idx;
+
+	for (file_idx = 0; file_idx < sbi->file_count; file_idx++) {
+		struct inode *inode;
+
+		inode = ilookup(sb, SIMPLEFS_FIRST_FILE_INO + file_idx);
+		if (!inode)
+			continue;
+
+		truncate_setsize(inode, 0);
+		clear_nlink(inode);
+		remove_inode_hash(inode);
+		invalidate_inode_pages2(inode->i_mapping);
+		make_bad_inode(inode);
+		d_prune_aliases(inode);
+		iput(inode);
+		cond_resched();
+	}
+
+	if (sb->s_root)
+		shrink_dcache_parent(sb->s_root);
+}
+
 static int simplefs_wipe_fs(struct super_block *sb)
 {
 	struct simplefs_info *sbi = simplefs_sb_info(sb);
@@ -740,19 +766,23 @@ static int simplefs_get_block(struct inode *inode, sector_t iblock,
 	struct simplefs_info *sbi = simplefs_sb_info(sb);
 	u32 file_index;
 	sector_t physical;
+	int ret = 0;
 
+	down_read(&sbi->state_lock);
 	if (inode->i_ino < SIMPLEFS_FIRST_FILE_INO)
-		return -EIO;
+		ret = -EIO;
+	else if (sbi->erased)
+		ret = -ENOENT;
+	else if (iblock >= sbi->file_sectors)
+		ret = -EFBIG;
+	else {
+		file_index = inode->i_ino - SIMPLEFS_FIRST_FILE_INO;
+		if (file_index >= sbi->file_count)
+			ret = -ENOENT;
+	}
 
-	if (sbi->erased)
-		return -ENOENT;
-
-	if (iblock >= sbi->file_sectors)
-		return -EFBIG;
-
-	file_index = inode->i_ino - SIMPLEFS_FIRST_FILE_INO;
-	if (file_index >= sbi->file_count)
-		return -ENOENT;
+	if (ret)
+		goto out_unlock;
 
 	physical = simplefs_file_sector(sbi, file_index, iblock);
 	map_bh(bh_result, sb, physical);
@@ -760,7 +790,9 @@ static int simplefs_get_block(struct inode *inode, sector_t iblock,
 	if (create)
 		set_buffer_new(bh_result);
 
-	return 0;
+out_unlock:
+	up_read(&sbi->state_lock);
+	return ret;
 }
 
 static int simplefs_read_folio(struct file *file, struct folio *folio)
@@ -821,12 +853,12 @@ static ssize_t simplefs_file_write_iter(struct kiocb *iocb, struct iov_iter *fro
 	struct simplefs_info *sbi = simplefs_sb_info(sb);
 	ssize_t ret;
 
-	mutex_lock(&sbi->ioctl_lock);
+	down_read(&sbi->state_lock);
 	if (sbi->erased)
 		ret = -ENOENT;
 	else
 		ret = generic_file_write_iter(iocb, from);
-	mutex_unlock(&sbi->ioctl_lock);
+	up_read(&sbi->state_lock);
 
 	return ret;
 }
@@ -837,12 +869,12 @@ static ssize_t simplefs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct simplefs_info *sbi = simplefs_sb_info(sb);
 	ssize_t ret;
 
-	mutex_lock(&sbi->ioctl_lock);
+	down_read(&sbi->state_lock);
 	if (sbi->erased)
 		ret = -ENOENT;
 	else
 		ret = generic_file_read_iter(iocb, to);
-	mutex_unlock(&sbi->ioctl_lock);
+	up_read(&sbi->state_lock);
 
 	return ret;
 }
@@ -879,7 +911,7 @@ static int simplefs_dir_iterate(struct file *file, struct dir_context *ctx)
 	char name[SIMPLEFS_IOCTL_NAME_MAX];
 	int ret = 0;
 
-	mutex_lock(&sbi->ioctl_lock);
+	down_read(&sbi->state_lock);
 
 	if (!dir_emit_dots(file, ctx))
 		goto out;
@@ -906,7 +938,7 @@ static int simplefs_dir_iterate(struct file *file, struct dir_context *ctx)
 	}
 
 out:
-	mutex_unlock(&sbi->ioctl_lock);
+	up_read(&sbi->state_lock);
 	return ret;
 }
 
@@ -917,10 +949,9 @@ static long simplefs_dir_ioctl(struct file *file, unsigned int cmd, unsigned lon
 	void __user *argp = (void __user *)arg;
 	int ret = -ENOTTY;
 
-	mutex_lock(&sbi->ioctl_lock);
-
 	switch (cmd) {
 	case SIMPLEFS_IOCTL_ZERO_FILES:
+		down_write(&sbi->state_lock);
 		if (!capable(CAP_SYS_ADMIN))
 			ret = -EPERM;
 		else if (sbi->erased)
@@ -931,8 +962,10 @@ static long simplefs_dir_ioctl(struct file *file, unsigned int cmd, unsigned lon
 			ret = simplefs_zero_all_files(sb);
 		if (!ret)
 			simplefs_invalidate_cached_files(sb);
+		up_write(&sbi->state_lock);
 		break;
 	case SIMPLEFS_IOCTL_WIPE_FS:
+		down_write(&sbi->state_lock);
 		if (!capable(CAP_SYS_ADMIN))
 			ret = -EPERM;
 		else
@@ -942,8 +975,10 @@ static long simplefs_dir_ioctl(struct file *file, unsigned int cmd, unsigned lon
 		if (!ret) {
 			sbi->erased = true;
 			simplefs_invalidate_cached_files(sb);
+			simplefs_detach_cached_files(sb);
 			simplefs_forget_file_dentries(sb);
 		}
+		up_write(&sbi->state_lock);
 		break;
 	case SIMPLEFS_IOCTL_GET_HASHES:
 	{
@@ -954,12 +989,15 @@ static long simplefs_dir_ioctl(struct file *file, unsigned int cmd, unsigned lon
 			break;
 		}
 
+		down_read(&sbi->state_lock);
 		ret = simplefs_writeback_cached_files(sb);
 		if (ret)
-			break;
+			goto out_hash_unlock;
 
 		ret = simplefs_copy_hash_entries(sb, u64_to_user_ptr(query.entries_ptr),
 						 query.capacity, &query.count);
+out_hash_unlock:
+		up_read(&sbi->state_lock);
 		if (ret)
 			break;
 
@@ -976,10 +1014,12 @@ static long simplefs_dir_ioctl(struct file *file, unsigned int cmd, unsigned lon
 			break;
 		}
 
+		down_read(&sbi->state_lock);
 		query.name[SIMPLEFS_IOCTL_NAME_MAX - 1] = '\0';
 		ret = simplefs_copy_sector_map(sb, query.name,
 					       u64_to_user_ptr(query.sectors_ptr),
 					       query.capacity, &query.count);
+		up_read(&sbi->state_lock);
 		if (ret)
 			break;
 
@@ -989,7 +1029,6 @@ static long simplefs_dir_ioctl(struct file *file, unsigned int cmd, unsigned lon
 	}
 	}
 
-	mutex_unlock(&sbi->ioctl_lock);
 	return ret;
 }
 
@@ -1019,7 +1058,7 @@ static struct dentry *simplefs_lookup(struct inode *dir, struct dentry *dentry,
 	struct dentry *ret;
 	int file_idx;
 
-	mutex_lock(&sbi->ioctl_lock);
+	down_read(&sbi->state_lock);
 
 	if (sbi->erased) {
 		ret = d_splice_alias(NULL, dentry);
@@ -1042,7 +1081,7 @@ static struct dentry *simplefs_lookup(struct inode *dir, struct dentry *dentry,
 	ret = d_splice_alias(inode, dentry);
 
 out:
-	mutex_unlock(&sbi->ioctl_lock);
+	up_read(&sbi->state_lock);
 	return ret;
 }
 
@@ -1132,7 +1171,7 @@ static int simplefs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->max_name_len = max_filename_len;
 	sbi->file_sectors_limit = max_file_sectors;
 	sbi->block_size = sb->s_blocksize;
-	mutex_init(&sbi->ioctl_lock);
+	init_rwsem(&sbi->state_lock);
 
 	sb->s_magic = SIMPLEFS_MAGIC;
 	sb->s_fs_info = sbi;

@@ -175,6 +175,13 @@ Smoke test собирает проект, создает loop device, загру
 sudo ./scripts/smoke_test.sh
 ```
 
+Для проверки замечаний по `wipe`, порче superblock и параллельным `ioctl`
+есть отдельный регрессионный сценарий:
+
+```bash
+sudo ./scripts/regression_test.sh
+```
+
 При успешном прохождении в конце будет:
 
 ```text
