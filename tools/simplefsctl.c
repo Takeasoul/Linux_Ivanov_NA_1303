@@ -243,9 +243,11 @@ static void usage(const char *prog)
 		"  %s fill <mountpoint>\n"
 		"  %s zero <mountpoint>\n"
 		"  %s wipe <mountpoint>\n"
+		"  %s erase <mountpoint>\n"
 		"  %s hashes <mountpoint>\n"
+		"  %s metadata <mountpoint>\n"
 		"  %s map <mountpoint> <filename>\n",
-		prog, prog, prog, prog, prog);
+		prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv)
@@ -267,7 +269,15 @@ int main(int argc, char **argv)
 		command_wipe(argv[2]);
 		return EXIT_SUCCESS;
 	}
+	if (!strcmp(argv[1], "erase")) {
+		command_wipe(argv[2]);
+		return EXIT_SUCCESS;
+	}
 	if (!strcmp(argv[1], "hashes")) {
+		command_hashes(argv[2]);
+		return EXIT_SUCCESS;
+	}
+	if (!strcmp(argv[1], "metadata")) {
 		command_hashes(argv[2]);
 		return EXIT_SUCCESS;
 	}
